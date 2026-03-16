@@ -1,0 +1,58 @@
+services:
+  db:
+    image: mysql:8.0
+    container_name: jde_design_db
+    command: --default-authentication-plugin=mysql_native_password --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: jde_design
+    ports:
+      - "3317:3306"
+    volumes:
+      - db_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: jde_design_backend
+    environment:
+      NODE_ENV: production
+      PORT: 8217
+      DATABASE_URL: mysql://root:root@db:3306/jde_design
+      JWT_SECRET: jde_design_super_secret_key
+      JWT_EXPIRES_IN: 12h
+      EXPORT_BASE_PATH: /app/generated
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8217:8217"
+    volumes:
+      - backend_exports:/app/generated
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: jde_design_frontend
+    depends_on:
+      - backend
+    ports:
+      - "3217:80"
+
+volumes:
+  db_data:
+  backend_exports:
+
+networks:
+  default:
+    name: jde_design_network
+    ipam:
+      config:
+        - subnet: 10.212.0.0/24
