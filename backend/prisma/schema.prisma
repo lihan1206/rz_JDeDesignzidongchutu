@@ -26,15 +26,37 @@ enum ExportFormat {
   PNG
 }
 
-model User {
-  id           Int       @id @default(autoincrement())
-  username     String    @unique
-  email        String    @unique
-  passwordHash String
-  role         UserRole  @default(USER)
-  createdAt    DateTime  @default(now())
-  projects     Project[]
+enum MemberRole {
+  OWNER
+  EDITOR
+  VIEWER
+}
 
+enum AuditAction {
+  CREATE
+  UPDATE
+  DELETE
+  EXPORT
+  LOGIN
+  LOGOUT
+  SHARE
+  RESTORE
+}
+
+model User {
+  id              Int              @id @default(autoincrement())
+  username        String           @unique
+  email           String           @unique
+  passwordHash    String
+  role            UserRole         @default(USER)
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+  projects        Project[]
+  projectMembers  ProjectMember[]
+  auditLogs       AuditLog[]
+
+  @@index([email])
+  @@index([username])
   @@map("users")
 }
 
@@ -51,8 +73,12 @@ model Project {
   versions    DesignVersion[]
   exports     ExportRecord[]
   realtime    RealtimeState?
+  members     ProjectMember[]
+  auditLogs   AuditLog[]
 
   @@index([userId])
+  @@index([status])
+  @@index([createdAt])
   @@map("projects")
 }
 
@@ -61,6 +87,7 @@ model DesignVersion {
   projectId Int
   version   Int      @default(1)
   data      Json
+  note      String?
   createdAt DateTime @default(now())
   project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
 
@@ -74,10 +101,13 @@ model ExportRecord {
   projectId  Int
   format     ExportFormat
   filePath   String
+  fileSize   Int          @default(0)
+  duration   Int          @default(0)
   exportedAt DateTime     @default(now())
   project    Project      @relation(fields: [projectId], references: [id], onDelete: Cascade)
 
   @@index([projectId])
+  @@index([exportedAt])
   @@map("exports")
 }
 
@@ -86,9 +116,15 @@ model Template {
   name        String   @unique
   description String
   category    String
+  thumbnail   String?
   baseData    Json
+  isPublic    Boolean  @default(true)
+  usageCount  Int      @default(0)
   createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
 
+  @@index([category])
+  @@index([isPublic])
   @@map("templates")
 }
 
@@ -100,4 +136,51 @@ model RealtimeState {
   project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
 
   @@map("realtime_states")
+}
+
+model ProjectMember {
+  id        Int        @id @default(autoincrement())
+  projectId Int
+  userId    Int
+  role      MemberRole @default(VIEWER)
+  invitedBy Int?
+  joinedAt  DateTime   @default(now())
+  project   Project    @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, userId])
+  @@index([projectId])
+  @@index([userId])
+  @@map("project_members")
+}
+
+model AuditLog {
+  id        Int         @id @default(autoincrement())
+  userId    Int?
+  projectId Int?
+  action    AuditAction
+  entity    String
+  entityId  Int?
+  oldValue  Json?
+  newValue  Json?
+  ip        String?
+  userAgent String?
+  createdAt DateTime    @default(now())
+  user      User?       @relation(fields: [userId], references: [id], onDelete: SetNull)
+  project   Project?    @relation(fields: [projectId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+  @@index([projectId])
+  @@index([action])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+model SystemConfig {
+  id        Int      @id @default(autoincrement())
+  key       String   @unique
+  value     Json
+  updatedAt DateTime @updatedAt
+
+  @@map("system_configs")
 }
