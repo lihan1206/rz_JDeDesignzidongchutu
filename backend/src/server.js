@@ -35,11 +35,26 @@ app.use(
   })
 );
 
+const allowedOrigins = [
+  "http://localhost:3217",
+  "http://127.0.0.1:3217",
+  "http://localhost:80",
+  "http://127.0.0.1:80"
+];
+
 app.use(
   cors({
-    origin: "*",
+    origin: (origin, callback) => {
+      if (!origin || allowedOrigins.includes(origin)) {
+        callback(null, true);
+      } else {
+        callback(new Error("Not allowed by CORS"));
+      }
+    },
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"]
+    allowedHeaders: ["Content-Type", "Authorization"],
+    credentials: true,
+    maxAge: 86400
   })
 );
 app.use(express.json({ limit: "3mb" }));
