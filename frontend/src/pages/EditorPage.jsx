@@ -9,7 +9,11 @@ import {
   PlusCircleOutlined,
   SaveOutlined,
   TeamOutlined,
-  UnlockOutlined
+  UnlockOutlined,
+  FileOutlined,
+  LoadingOutlined,
+  CheckCircleOutlined,
+  CloseCircleOutlined
 } from "@ant-design/icons";
 import {
   Button,
@@ -22,6 +26,7 @@ import {
   InputNumber,
   List,
   Modal,
+  Progress,
   Row,
   Select,
   Skeleton,
@@ -31,16 +36,19 @@ import {
   Tag,
   Tooltip,
   Typography,
-  message
+  message,
+  Badge
 } from "antd";
 import dayjs from "dayjs";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import { Circle, Group, Layer, Line, Rect, Stage, Text } from "react-konva";
 import { io } from "socket.io-client";
 import { useNavigate, useParams } from "react-router-dom";
 import {
-  apiExportProject,
-  apiGetExportRecords,
+  apiQueueExport,
+  apiGetExportHistory,
+  apiGetExportQueue,
+  apiCancelExport,
   apiGetProject,
   apiGetVersions,
   apiRestoreVersion,
@@ -75,9 +83,12 @@ function EditorPage() {
   const [versions, setVersions] = useState([]);
   const [exportRecords, setExportRecords] = useState([]);
   const [exportingFormat, setExportingFormat] = useState("");
+  const [exportProgress, setExportProgress] = useState({});
+  const [exportQueue, setExportQueue] = useState([]);
   const [snapEnabled, setSnapEnabled] = useState(true);
   const [collaborators, setCollaborators] = useState([]);
   const [syncStatus, setSyncStatus] = useState("未连接");
+  const [activeExportId, setActiveExportId] = useState(null);
 
   const selectedElement = useMemo(
     () => designData.elements.find((item) => item.id === selectedId) || null,
@@ -103,7 +114,7 @@ function EditorPage() {
       const [projectData, versionData, exportsData] = await Promise.all([
         apiGetProject(id),
         apiGetVersions(id),
-        apiGetExportRecords(id)
+        apiGetExportHistory({ projectId: id, pageSize: 8 }).then(r => r.data?.records || [])
       ]);
       setProject(projectData);
       setVersions(versionData);
@@ -220,6 +231,30 @@ function EditorPage() {
       setCollaborators(payload?.collaborators || []);
     });
 
+    // 监听导出进度
+    socket.on("export:progress", (payload) => {
+      if (payload?.exportId) {
+        setExportProgress(prev => ({
+          ...prev,
+          [payload.exportId]: {
+            progress: payload.progress,
+            status: payload.status,
+            message: payload.message
+          }
+        }));
+        
+        // 导出完成时刷新记录
+        if (payload.status === "COMPLETED" || payload.status === "FAILED") {
+          setTimeout(() => fetchExportRecords(), 500);
+          if (payload.status === "COMPLETED") {
+            message.success(`导出完成: ${payload.message}`);
+          } else if (payload.status === "FAILED") {
+            message.error(`导出失败: ${payload.message}`);
+          }
+        }
+      }
+    });
+
     return () => {
       if (syncTimerRef.current) {
         clearTimeout(syncTimerRef.current);
@@ -229,6 +264,27 @@ function EditorPage() {
       setSyncStatus("未连接");
     };
   }, [id]);
+
+  // 获取导出记录
+  const fetchExportRecords = useCallback(async () => {
+    if (Number.isNaN(id)) return;
+    try {
+      const result = await apiGetExportHistory({ projectId: id, pageSize: 8 });
+      setExportRecords(result.data?.records || []);
+    } catch (error) {
+      console.error("获取导出记录失败:", error);
+    }
+  }, [id]);
+
+  // 获取导出队列状态
+  const fetchExportQueue = useCallback(async () => {
+    try {
+      const result = await apiGetExportQueue();
+      setExportQueue(result.data || []);
+    } catch (error) {
+      console.error("获取导出队列失败:", error);
+    }
+  }, []);
 
   function ensureElementEditable(element) {
     if (!element) {
@@ -397,12 +453,62 @@ function EditorPage() {
   async function handleExport(format) {
     try {
       setExportingFormat(format);
-      const record = await apiExportProject(id, format);
-      message.success(`${format} 导出成功`);
-      setExportRecords((prev) => [record, ...prev]);
+      const result = await apiQueueExport({ 
+        projectId: id, 
+        format, 
+        designData 
+      });
+      
+      if (result.success) {
+        const exportId = result.data?.exportId;
+        setActiveExportId(exportId);
+        message.success(`${format} 导出任务已创建，正在处理中...`);
+        
+        // 初始化进度
+        setExportProgress(prev => ({
+          ...prev,
+          [exportId]: { progress: 0, status: "QUEUED", message: "等待处理..." }
+        }));
+        
+        // 刷新队列状态
+        fetchExportQueue();
+      }
+    } catch (error) {
+      message.error(`导出失败: ${error.message || "未知错误"}`);
     } finally {
       setExportingFormat("");
     }
+  }
+
+  // 取消导出
+  async function handleCancelExport(exportId) {
+    try {
+      const result = await apiCancelExport(exportId);
+      if (result.success) {
+        message.success("导出任务已取消");
+        fetchExportQueue();
+      } else {
+        message.warning(result.message || "无法取消该导出任务");
+      }
+    } catch (error) {
+      message.error(`取消失败: ${error.message || "未知错误"}`);
+    }
+  }
+
+  // 获取状态标签
+  function getStatusBadge(status) {
+    const statusMap = {
+      PENDING: { color: "default", text: "等待中", icon: <FileOutlined /> },
+      QUEUED: { color: "processing", text: "队列中", icon: <LoadingOutlined /> },
+      PROCESSING: { color: "processing", text: "处理中", icon: <LoadingOutlined /> },
+      COMPLETED: { color: "success", text: "已完成", icon: <CheckCircleOutlined /> },
+      FAILED: { color: "error", text: "失败", icon: <CloseCircleOutlined /> },
+      CANCELLED: { color: "warning", text: "已取消", icon: <CloseCircleOutlined /> }
+    };
+    const config = statusMap[status] || statusMap.PENDING;
+    return (
+      <Badge status={config.color} text={config.text} icon={config.icon} />
+    );
   }
 
   function renderPropertyFields() {
@@ -956,9 +1062,62 @@ function EditorPage() {
 
               <Divider style={{ margin: "4px 0" }} />
 
+              <Typography.Text strong>导出队列</Typography.Text>
+              {exportQueue.length === 0 ? (
+                <Empty description="暂无进行中的导出任务" image={Empty.PRESENTED_IMAGE_SIMPLE} />
+              ) : (
+                <List
+                  size="small"
+                  dataSource={exportQueue}
+                  renderItem={(item) => {
+                    const progress = exportProgress[item.exportId];
+                    const isProcessing = item.status === "PROCESSING" || item.status === "QUEUED";
+                    
+                    return (
+                      <List.Item
+                        actions={[
+                          isProcessing && (
+                            <Button 
+                              key="cancel" 
+                              type="link" 
+                              size="small"
+                              danger
+                              onClick={() => handleCancelExport(item.exportId)}
+                            >
+                              取消
+                            </Button>
+                          )
+                        ]}
+                      >
+                        <Space direction="vertical" size={4} style={{ width: "100%" }}>
+                          <Space>
+                            <Typography.Text strong>{item.format}</Typography.Text>
+                            {getStatusBadge(item.status)}
+                          </Space>
+                          {progress && isProcessing && (
+                            <Progress 
+                              percent={progress.progress} 
+                              size="small" 
+                              status={progress.status === "FAILED" ? "exception" : "active"}
+                            />
+                          )}
+                          {progress?.message && (
+                            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                              {progress.message}
+                            </Typography.Text>
+                          )}
+                        </Space>
+                      </List.Item>
+                    );
+                  }}
+                />
+              )}
+
+              <Divider style={{ margin: "4px 0" }} />
+
               <Typography.Text strong>导出记录（最近 8 条）</Typography.Text>
               {exportRecords.length === 0 ? (
-                <Empty description="暂无导出记录" />
+                <Empty description="暂无导出记录" image={Empty.PRESENTED_IMAGE_SIMPLE} />
               ) : (
                 <List
                   size="small"
@@ -966,14 +1125,32 @@ function EditorPage() {
                   renderItem={(item) => (
                     <List.Item
                       actions={[
-                        <Button key="download" type="link" href={buildDownloadUrl(item.id)} target="_blank" rel="noreferrer">
-                          下载
-                        </Button>
+                        item.status === "COMPLETED" && (
+                          <Button 
+                            key="download" 
+                            type="link" 
+                            href={buildDownloadUrl(item.id)} 
+                            target="_blank" 
+                            rel="noreferrer"
+                          >
+                            下载
+                          </Button>
+                        )
                       ]}
                     >
                       <Space direction="vertical" size={0}>
-                        <Typography.Text>{item.format}</Typography.Text>
-                        <Typography.Text type="secondary">{dayjs(item.exportedAt).format("YYYY-MM-DD HH:mm:ss")}</Typography.Text>
+                        <Space>
+                          <Typography.Text>{item.format}</Typography.Text>
+                          {getStatusBadge(item.status)}
+                        </Space>
+                        <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                          {dayjs(item.createdAt).format("YYYY-MM-DD HH:mm:ss")}
+                        </Typography.Text>
+                        {item.fileSize > 0 && (
+                          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                            {(item.fileSize / 1024).toFixed(2)} KB
+                          </Typography.Text>
+                        )}
                       </Space>
                     </List.Item>
                   )}

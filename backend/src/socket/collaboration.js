@@ -5,6 +5,9 @@ import { verifyToken } from "../utils/jwt.js";
 
 const projectPresenceMap = new Map();
 
+// WebSocket 服务器实例
+let ioInstance = null;
+
 const fallbackDesign = {
   canvas: {
     width: 1200,
@@ -118,6 +121,7 @@ async function socketAuthMiddleware(socket, next) {
     }
 
     socket.data.user = user;
+    socket.userId = user.id; // 用于导出进度通知
     next();
   } catch (_error) {
     next(new Error("鉴权失败"));
@@ -130,6 +134,9 @@ export function setupCollaborationSocket(httpServer) {
       origin: "*"
     }
   });
+
+  // 保存实例供其他模块使用
+  ioInstance = io;
 
   io.use(socketAuthMiddleware);
 
@@ -235,3 +242,32 @@ export function setupCollaborationSocket(httpServer) {
 
   return io;
 }
+
+// 获取 WebSocket 服务器实例
+export function getWebSocketServer() {
+  return ioInstance;
+}
+
+// 发送导出进度通知给特定用户
+export function sendExportProgressToUser(userId, payload) {
+  if (!ioInstance) {
+    logger.warn("WebSocket 服务器未初始化，无法发送导出进度");
+    return false;
+  }
+
+  let sent = false;
+  ioInstance.sockets.sockets.forEach((socket) => {
+    if (socket.userId === userId) {
+      socket.emit("export:progress", payload);
+      sent = true;
+    }
+  });
+
+  return sent;
+}
+
+export default {
+  setupCollaborationSocket,
+  getWebSocketServer,
+  sendExportProgressToUser
+};

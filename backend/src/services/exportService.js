@@ -5,6 +5,12 @@ import PDFDocument from "pdfkit";
 import sharp from "sharp";
 import config from "../config.js";
 import HttpError from "../utils/httpError.js";
+import prisma from "../prisma.js";
+import { sendExportProgressToUser } from "../socket/collaboration.js";
+
+// 导出任务队列
+const exportQueue = new Map();
+let queueIdCounter = 1;
 
 function ensureDirSync(dirPath) {
   if (!fs.existsSync(dirPath)) {
@@ -339,46 +345,364 @@ function writePdf(filePath, data) {
   });
 }
 
-export async function generateExportFile(projectId, format, designData) {
+// 发送导出进度通知
+function sendExportProgress(userId, exportId, progress, status, message = "") {
+  const payload = {
+    exportId,
+    progress,
+    status,
+    message,
+    timestamp: new Date().toISOString()
+  };
+
+  sendExportProgressToUser(userId, payload);
+}
+
+// 创建导出记录
+export async function createExportRecord(projectId, format, userId) {
+  const record = await prisma.exportRecord.create({
+    data: {
+      projectId,
+      format: format.toUpperCase(),
+      status: "PENDING",
+      filePath: "",
+      fileSize: 0,
+      createdBy: userId
+    }
+  });
+  return record;
+}
+
+// 更新导出记录
+export async function updateExportRecord(exportId, data) {
+  const record = await prisma.exportRecord.update({
+    where: { id: exportId },
+    data: {
+      ...data,
+      updatedAt: new Date()
+    }
+  });
+  return record;
+}
+
+// 执行导出任务
+async function executeExport(exportId, projectId, format, designData, userId) {
   const normalizedFormat = String(format || "").toUpperCase();
   const supported = ["PDF", "SVG", "DXF", "PNG"];
 
   if (!supported.includes(normalizedFormat)) {
+    await updateExportRecord(exportId, {
+      status: "FAILED",
+      errorMessage: "暂不支持该导出格式"
+    });
+    sendExportProgress(userId, exportId, 0, "FAILED", "暂不支持该导出格式");
     throw new HttpError(400, "暂不支持该导出格式");
   }
 
-  ensureDirSync(config.exportBasePath);
-  const timePart = dayjs().format("YYYYMMDD_HHmmss_SSS");
-  const baseName = `project_${projectId}_${timePart}`;
+  try {
+    // 更新状态为处理中
+    await updateExportRecord(exportId, { status: "PROCESSING" });
+    sendExportProgress(userId, exportId, 10, "PROCESSING", "开始导出...");
 
-  if (normalizedFormat === "SVG") {
-    const fileName = `${baseName}.svg`;
-    const absolutePath = path.join(config.exportBasePath, fileName);
-    const svgContent = buildSvg(designData);
-    fs.writeFileSync(absolutePath, svgContent, "utf-8");
-    return { fileName, absolutePath, relativePath: fileName };
+    ensureDirSync(config.exportBasePath);
+    const timePart = dayjs().format("YYYYMMDD_HHmmss_SSS");
+    const baseName = `project_${projectId}_${timePart}`;
+
+    let result;
+
+    if (normalizedFormat === "SVG") {
+      sendExportProgress(userId, exportId, 30, "PROCESSING", "生成 SVG 内容...");
+      const fileName = `${baseName}.svg`;
+      const absolutePath = path.join(config.exportBasePath, fileName);
+      const svgContent = buildSvg(designData);
+      
+      sendExportProgress(userId, exportId, 60, "PROCESSING", "写入文件...");
+      fs.writeFileSync(absolutePath, svgContent, "utf-8");
+      
+      const stats = fs.statSync(absolutePath);
+      result = { fileName, absolutePath, relativePath: fileName, fileSize: stats.size };
+    }
+
+    if (normalizedFormat === "DXF") {
+      sendExportProgress(userId, exportId, 30, "PROCESSING", "生成 DXF 内容...");
+      const fileName = `${baseName}.dxf`;
+      const absolutePath = path.join(config.exportBasePath, fileName);
+      const dxfContent = buildDxf(designData);
+      
+      sendExportProgress(userId, exportId, 60, "PROCESSING", "写入文件...");
+      fs.writeFileSync(absolutePath, dxfContent, "utf-8");
+      
+      const stats = fs.statSync(absolutePath);
+      result = { fileName, absolutePath, relativePath: fileName, fileSize: stats.size };
+    }
+
+    if (normalizedFormat === "PDF") {
+      sendExportProgress(userId, exportId, 30, "PROCESSING", "生成 PDF 内容...");
+      const fileName = `${baseName}.pdf`;
+      const absolutePath = path.join(config.exportBasePath, fileName);
+      
+      sendExportProgress(userId, exportId, 60, "PROCESSING", "渲染 PDF...");
+      await writePdf(absolutePath, designData);
+      
+      const stats = fs.statSync(absolutePath);
+      result = { fileName, absolutePath, relativePath: fileName, fileSize: stats.size };
+    }
+
+    if (normalizedFormat === "PNG") {
+      sendExportProgress(userId, exportId, 30, "PROCESSING", "生成 PNG 内容...");
+      const fileName = `${baseName}.png`;
+      const absolutePath = path.join(config.exportBasePath, fileName);
+      const svg = buildSvg(designData);
+      
+      sendExportProgress(userId, exportId, 60, "PROCESSING", "渲染 PNG...");
+      await sharp(Buffer.from(svg)).png({ quality: 100 }).toFile(absolutePath);
+      
+      const stats = fs.statSync(absolutePath);
+      result = { fileName, absolutePath, relativePath: fileName, fileSize: stats.size };
+    }
+
+    // 更新记录为完成
+    await updateExportRecord(exportId, {
+      status: "COMPLETED",
+      filePath: result.relativePath,
+      fileSize: result.fileSize,
+      completedAt: new Date()
+    });
+
+    sendExportProgress(userId, exportId, 100, "COMPLETED", "导出完成");
+    
+    return result;
+  } catch (error) {
+    await updateExportRecord(exportId, {
+      status: "FAILED",
+      errorMessage: error.message
+    });
+    sendExportProgress(userId, exportId, 0, "FAILED", error.message);
+    throw error;
+  }
+}
+
+// 异步导出（添加到队列）
+export async function queueExport(projectId, format, designData, userId) {
+  const record = await createExportRecord(projectId, format, userId);
+  const exportId = record.id;
+
+  // 添加到队列
+  const queueItem = {
+    id: queueIdCounter++,
+    exportId,
+    projectId,
+    format,
+    designData,
+    userId,
+    status: "QUEUED",
+    createdAt: new Date()
+  };
+
+  exportQueue.set(exportId, queueItem);
+
+  // 异步处理
+  setImmediate(async () => {
+    try {
+      queueItem.status = "PROCESSING";
+      await executeExport(exportId, projectId, format, designData, userId);
+      queueItem.status = "COMPLETED";
+    } catch (error) {
+      queueItem.status = "FAILED";
+      queueItem.error = error.message;
+    } finally {
+      // 5分钟后从队列中移除
+      setTimeout(() => {
+        exportQueue.delete(exportId);
+      }, 5 * 60 * 1000);
+    }
+  });
+
+  return { exportId, status: "QUEUED" };
+}
+
+// 同步导出（立即执行）
+export async function generateExportFile(projectId, format, designData, userId) {
+  const record = await createExportRecord(projectId, format, userId);
+  return executeExport(record.id, projectId, format, designData, userId);
+}
+
+// 批量导出
+export async function batchExport(exports, userId) {
+  const results = [];
+  const errors = [];
+
+  for (const item of exports) {
+    try {
+      const { projectId, format, designData } = item;
+      const result = await queueExport(projectId, format, designData, userId);
+      results.push({ projectId, format, exportId: result.exportId, status: "QUEUED" });
+    } catch (error) {
+      errors.push({ projectId: item.projectId, format: item.format, error: error.message });
+    }
   }
 
-  if (normalizedFormat === "DXF") {
-    const fileName = `${baseName}.dxf`;
-    const absolutePath = path.join(config.exportBasePath, fileName);
-    const dxfContent = buildDxf(designData);
-    fs.writeFileSync(absolutePath, dxfContent, "utf-8");
-    return { fileName, absolutePath, relativePath: fileName };
+  return { results, errors, total: exports.length, success: results.length, failed: errors.length };
+}
+
+// 获取导出队列状态
+export function getExportQueueStatus(userId) {
+  const userExports = [];
+  exportQueue.forEach((item) => {
+    if (item.userId === userId) {
+      userExports.push({
+        exportId: item.exportId,
+        projectId: item.projectId,
+        format: item.format,
+        status: item.status,
+        createdAt: item.createdAt
+      });
+    }
+  });
+  return userExports;
+}
+
+// 取消导出任务
+export async function cancelExport(exportId, userId) {
+  const queueItem = exportQueue.get(exportId);
+  
+  if (queueItem && queueItem.userId === userId && queueItem.status === "QUEUED") {
+    queueItem.status = "CANCELLED";
+    await updateExportRecord(exportId, {
+      status: "CANCELLED",
+      errorMessage: "用户取消导出"
+    });
+    return { success: true, message: "导出任务已取消" };
   }
 
-  if (normalizedFormat === "PDF") {
-    const fileName = `${baseName}.pdf`;
-    const absolutePath = path.join(config.exportBasePath, fileName);
-    await writePdf(absolutePath, designData);
-    return { fileName, absolutePath, relativePath: fileName };
+  if (queueItem && queueItem.status === "PROCESSING") {
+    return { success: false, message: "导出任务正在处理中，无法取消" };
   }
 
-  const fileName = `${baseName}.png`;
-  const absolutePath = path.join(config.exportBasePath, fileName);
-  const svg = buildSvg(designData);
-  await sharp(Buffer.from(svg)).png({ quality: 100 }).toFile(absolutePath);
-  return { fileName, absolutePath, relativePath: fileName };
+  return { success: false, message: "导出任务不存在或已完成" };
+}
+
+// 获取导出历史
+export async function getExportHistory(userId, options = {}) {
+  const { page = 1, pageSize = 20, status, format, projectId } = options;
+  const skip = (page - 1) * pageSize;
+
+  const where = { createdBy: userId };
+  if (status) where.status = status;
+  if (format) where.format = format.toUpperCase();
+  if (projectId) where.projectId = projectId;
+
+  const [records, total] = await Promise.all([
+    prisma.exportRecord.findMany({
+      where,
+      orderBy: { createdAt: "desc" },
+      skip,
+      take: pageSize,
+      include: {
+        project: {
+          select: {
+            id: true,
+            name: true
+          }
+        }
+      }
+    }),
+    prisma.exportRecord.count({ where })
+  ]);
+
+  return {
+    records,
+    pagination: {
+      page,
+      pageSize,
+      total,
+      totalPages: Math.ceil(total / pageSize)
+    }
+  };
+}
+
+// 删除导出记录
+export async function deleteExportRecord(exportId, userId) {
+  const record = await prisma.exportRecord.findUnique({
+    where: { id: exportId },
+    include: {
+      project: {
+        select: { userId: true }
+      }
+    }
+  });
+
+  if (!record) {
+    throw new HttpError(404, "导出记录不存在");
+  }
+
+  if (record.project.userId !== userId) {
+    throw new HttpError(403, "没有权限删除该导出记录");
+  }
+
+  // 删除文件
+  if (record.filePath) {
+    const absolutePath = resolveFilePath(record.filePath);
+    if (fs.existsSync(absolutePath)) {
+      fs.unlinkSync(absolutePath);
+    }
+  }
+
+  await prisma.exportRecord.delete({
+    where: { id: exportId }
+  });
+
+  return { success: true };
+}
+
+// 批量删除导出记录
+export async function batchDeleteExportRecords(exportIds, userId) {
+  const results = [];
+  const errors = [];
+
+  for (const exportId of exportIds) {
+    try {
+      await deleteExportRecord(exportId, userId);
+      results.push(exportId);
+    } catch (error) {
+      errors.push({ exportId, error: error.message });
+    }
+  }
+
+  return { success: results.length, failed: errors.length, errors };
+}
+
+// 清理过期导出文件
+export async function cleanupExpiredExports(maxAgeDays = 30) {
+  const cutoffDate = dayjs().subtract(maxAgeDays, "day").toDate();
+  
+  const expiredRecords = await prisma.exportRecord.findMany({
+    where: {
+      createdAt: { lt: cutoffDate },
+      status: { in: ["COMPLETED", "FAILED"] }
+    }
+  });
+
+  let deletedCount = 0;
+  for (const record of expiredRecords) {
+    try {
+      if (record.filePath) {
+        const absolutePath = resolveFilePath(record.filePath);
+        if (fs.existsSync(absolutePath)) {
+          fs.unlinkSync(absolutePath);
+        }
+      }
+      
+      await prisma.exportRecord.delete({
+        where: { id: record.id }
+      });
+      deletedCount++;
+    } catch (error) {
+      console.error(`清理导出记录失败: ${record.id}`, error);
+    }
+  }
+
+  return { deletedCount, totalExpired: expiredRecords.length };
 }
 
 export function resolveFilePath(relativePath) {
